@@ -272,7 +272,11 @@ class ExecConnectionError extends Error {
   // Only set by execLauncherOnce, so execDetachedScriptStep's retry can
   // resume its tail from the right byte offset instead of replaying output.
   bytesStreamed?: number
-  constructor(message?: string, bytesStreamed?: number) {
+  // True when the stream merely went quiet. A healthy step can print nothing
+  // for many minutes (test output buffered to a file). That is not a failed
+  // connection, so it must not consume the retry budget.
+  idle: boolean
+  constructor(message?: string, bytesStreamed?: number, idle = false) {
     super(message)
     // This repo compiles to ES5 (see tsconfig.json), where extending a
     // built-in like Error breaks the prototype chain unless restored
@@ -280,6 +284,7 @@ class ExecConnectionError extends Error {
     // false and the retry above never fires.
     Object.setPrototypeOf(this, ExecConnectionError.prototype)
     this.bytesStreamed = bytesStreamed
+    this.idle = idle
   }
 }
 
@@ -369,7 +374,10 @@ async function execPodStepOnce(
             // connection-setup failure. Gate on the message too, not just
             // hasOutput() — anything else (e.g. a real "command not found"
             // with no output) keeps its original rejection value unchanged.
-            if (!hasOutput() && /no agent available/i.test(formatError(resp?.message))) {
+            if (
+              !hasOutput() &&
+              /no agent available/i.test(formatError(resp?.message))
+            ) {
               reject(new ExecConnectionError(formatError(resp?.message)))
             } else {
               reject(resp?.message)
@@ -400,7 +408,10 @@ function countedOutput(target: NodeJS.WritableStream): {
 
 // A connection that goes silent without the client-node library ever
 // invoking the resp callback (no close/error status) would otherwise hang
-// a detached-script step forever — this bounds that.
+// a detached-script step forever. Reconnect and keep tailing. Silence itself
+// is not a failure: only a real connect or stream error counts toward
+// DETACHED_SCRIPT_MAX_ATTEMPTS, and that count resets once a reconnect
+// delivers new output.
 const DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS = 120
 const DETACHED_SCRIPT_MAX_ATTEMPTS = 10
 
@@ -424,7 +435,8 @@ async function execLauncherOnce(
           reject(
             new ExecConnectionError(
               `no output for ${DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS}s, assuming dropped connection`,
-              totalBytes()
+              totalBytes(),
+              true
             )
           )
         }, DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS * 1000)
@@ -447,13 +459,20 @@ async function execLauncherOnce(
             if (resp.status === 'Success') {
               resolve()
             } else if (/no agent available/i.test(formatError(resp?.message))) {
-              reject(new ExecConnectionError(formatError(resp?.message), totalBytes()))
+              reject(
+                new ExecConnectionError(
+                  formatError(resp?.message),
+                  totalBytes()
+                )
+              )
             } else {
               reject(resp?.message)
             }
           }
         )
-        .catch(e => reject(new ExecConnectionError(formatError(e), totalBytes())))
+        .catch(e =>
+          reject(new ExecConnectionError(formatError(e), totalBytes()))
+        )
     })
   } finally {
     clearTimeout(idleTimer)
@@ -478,7 +497,7 @@ export async function execDetachedScriptStep(
 ): Promise<void> {
   const backOffManager = new BackOffManager()
   let offset = 0
-  let attempt = 0
+  let connectionFailures = 0
   while (true) {
     try {
       return await execLauncherOnce(
@@ -487,19 +506,30 @@ export async function execDetachedScriptStep(
         containerName
       )
     } catch (error) {
-      attempt++
-      if (
-        !(error instanceof ExecConnectionError) ||
-        attempt >= DETACHED_SCRIPT_MAX_ATTEMPTS
-      ) {
+      if (!(error instanceof ExecConnectionError)) {
         throw error
       }
-      if (typeof error.bytesStreamed === 'number') {
-        offset += error.bytesStreamed
+      const streamed =
+        typeof error.bytesStreamed === 'number' ? error.bytesStreamed : 0
+      offset += streamed
+      // Output, or a stream that stayed up and merely went quiet, means this
+      // reconnect reached the still-running step. The next real drop is a new
+      // incident rather than one more strike.
+      if (streamed > 0 || error.idle) {
+        connectionFailures = 0
       }
+      if (!error.idle) {
+        connectionFailures++
+        if (connectionFailures >= DETACHED_SCRIPT_MAX_ATTEMPTS) {
+          throw error
+        }
+      }
+      const where = `resuming from byte offset ${offset}`
       core.warning(
-        `[execDetachedScriptStep] connection dropped mid-stream, resuming from byte ` +
-          `offset ${offset} (attempt ${attempt}/${DETACHED_SCRIPT_MAX_ATTEMPTS}): ${formatError(error)}`
+        error.idle
+          ? `[execDetachedScriptStep] ${formatError(error)}; ${where}`
+          : `[execDetachedScriptStep] connection dropped mid-stream, ${where} ` +
+              `(attempt ${connectionFailures}/${DETACHED_SCRIPT_MAX_ATTEMPTS}): ${formatError(error)}`
       )
       await backOffManager.backOff()
     }

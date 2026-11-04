@@ -173,6 +173,81 @@ describe('execDetachedScriptStep', () => {
     expect(mockExecFn).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps tailing through more idle timeouts than the connection-failure cap', async () => {
+    ;(core.warning as jest.Mock).mockClear()
+    let calls = 0
+    mockExecFn.mockImplementation((...args) => {
+      calls++
+      if (calls <= 11) {
+        return Promise.resolve(MOCK_WEBSOCKET)
+      }
+      const callback = callbackArg(args)
+      setTimeout(() => callback({ status: 'Success', code: 0 }), 0)
+      return Promise.resolve(MOCK_WEBSOCKET)
+    })
+
+    const promise = execDetachedScriptStep(
+      '/__w/_temp/launcher.sh',
+      'pod-1',
+      'job'
+    )
+    // 11 silent windows of 120s, plus the growing reconnect backoff.
+    await jest.advanceTimersByTimeAsync(1600000)
+
+    await expect(promise).resolves.toBeUndefined()
+    expect(mockExecFn).toHaveBeenCalledTimes(12)
+    expect(core.warning).toHaveBeenCalledTimes(11)
+  })
+
+  it('resets the connection-failure count after a reconnect delivers output', async () => {
+    let calls = 0
+    mockExecFn.mockImplementation((...args) => {
+      calls++
+      if (calls === 9) {
+        stdoutArg(args).write('progress')
+      }
+      return Promise.reject(new Error('No agent available: dial tcp timeout'))
+    })
+
+    const promise = execDetachedScriptStep(
+      '/__w/_temp/launcher.sh',
+      'pod-1',
+      'job'
+    )
+    const assertion = expect(promise).rejects.toThrow(/No agent available/)
+    await jest.advanceTimersByTimeAsync(600000)
+    await assertion
+    // Eight dial failures, then one that delivered output (count resets to
+    // 1), then nine more with no output until the cap of 10. 8 + 1 + 9 = 18.
+    expect(mockExecFn).toHaveBeenCalledTimes(18)
+  })
+
+  it('clears the connection-failure count when a reconnect stays up but silent', async () => {
+    let calls = 0
+    mockExecFn.mockImplementation((...args) => {
+      calls++
+      if (calls === 9) {
+        return Promise.resolve(MOCK_WEBSOCKET)
+      }
+      if (calls === 18) {
+        const callback = callbackArg(args)
+        setTimeout(() => callback({ status: 'Success', code: 0 }), 0)
+        return Promise.resolve(MOCK_WEBSOCKET)
+      }
+      return Promise.reject(new Error('No agent available: dial tcp timeout'))
+    })
+
+    const promise = execDetachedScriptStep(
+      '/__w/_temp/launcher.sh',
+      'pod-1',
+      'job'
+    )
+    await jest.advanceTimersByTimeAsync(600000)
+
+    await expect(promise).resolves.toBeUndefined()
+    expect(mockExecFn).toHaveBeenCalledTimes(18)
+  })
+
   it('gives up after the max attempts and throws', async () => {
     mockExecFn.mockImplementation(() =>
       Promise.reject(new Error('No agent available: dial tcp timeout'))

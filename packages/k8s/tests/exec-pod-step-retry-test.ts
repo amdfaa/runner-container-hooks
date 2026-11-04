@@ -40,8 +40,14 @@ const MOCK_WEBSOCKET = {}
 // args passed to exec.exec(namespace, pod, container, command, stdout,
 // stderr, stdin, tty, callback) — callback is the 9th (index 8) argument,
 // stdout/stderr are indices 4 and 5.
-function callbackArg(args: unknown[]): (resp: { status: string; code?: number; message?: string }) => void {
-  return args[8] as (resp: { status: string; code?: number; message?: string }) => void
+function callbackArg(
+  args: unknown[]
+): (resp: { status: string; code?: number; message?: string }) => void {
+  return args[8] as (resp: {
+    status: string
+    code?: number
+    message?: string
+  }) => void
 }
 function stdoutArg(args: unknown[]): NodeJS.WritableStream {
   return args[4] as NodeJS.WritableStream
@@ -61,7 +67,9 @@ describe('execPodStep retry on dial failures', () => {
   it('retries a pre-connection "No agent available" rejection and then succeeds', async () => {
     mockExecFn
       .mockImplementationOnce(() =>
-        Promise.reject(new Error('No agent available: dial tcp 10.0.0.5:10250: i/o timeout'))
+        Promise.reject(
+          new Error('No agent available: dial tcp 10.0.0.5:10250: i/o timeout')
+        )
       )
       .mockImplementationOnce((...args) => {
         const callback = callbackArg(args)
@@ -81,7 +89,11 @@ describe('execPodStep retry on dial failures', () => {
       .mockImplementationOnce((...args) => {
         const callback = callbackArg(args)
         setTimeout(
-          () => callback({ status: 'Failure', message: 'No agent available: dial tcp timeout' }),
+          () =>
+            callback({
+              status: 'Failure',
+              message: 'No agent available: dial tcp timeout'
+            }),
           0
         )
         return Promise.resolve(MOCK_WEBSOCKET)
@@ -97,7 +109,9 @@ describe('execPodStep retry on dial failures', () => {
 
     await expect(promise).resolves.toBeUndefined()
     expect(mockExecFn).toHaveBeenCalledTimes(2)
-    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('No agent available'))
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('No agent available')
+    )
   })
 
   it('does NOT retry a resp-callback "No agent available" failure once output was produced', async () => {
@@ -106,14 +120,20 @@ describe('execPodStep retry on dial failures', () => {
       out.write('partial test output\n')
       const callback = callbackArg(args)
       setTimeout(
-        () => callback({ status: 'Failure', message: 'No agent available: dial tcp timeout' }),
+        () =>
+          callback({
+            status: 'Failure',
+            message: 'No agent available: dial tcp timeout'
+          }),
         0
       )
       return Promise.resolve(MOCK_WEBSOCKET)
     })
 
     const promise = execPodStep(['sh', '-c', 'true'], 'pod-1', 'runner')
-    const assertion = expect(promise).rejects.toBe('No agent available: dial tcp timeout')
+    const assertion = expect(promise).rejects.toBe(
+      'No agent available: dial tcp timeout'
+    )
     await jest.advanceTimersByTimeAsync(1000)
     await assertion
     expect(mockExecFn).toHaveBeenCalledTimes(1)
@@ -122,7 +142,10 @@ describe('execPodStep retry on dial failures', () => {
   it('does not retry a resp-callback failure with an unrelated message, even with no output', async () => {
     mockExecFn.mockImplementation((...args) => {
       const callback = callbackArg(args)
-      setTimeout(() => callback({ status: 'Failure', message: 'command not found' }), 0)
+      setTimeout(
+        () => callback({ status: 'Failure', message: 'command not found' }),
+        0
+      )
       return Promise.resolve(MOCK_WEBSOCKET)
     })
 
