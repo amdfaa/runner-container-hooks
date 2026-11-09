@@ -34,10 +34,20 @@ jest.mock('crypto', () => {
   }
 })
 
+import { spawn, spawnSync } from 'child_process'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import * as core from '@actions/core'
 import {
+  buildKillStepGroupCommand,
+  deployRpcServer,
   killRpcJob,
-  rpcPodStep,
-  RPC_HEARTBEAT_GRACE_SECONDS
+  RPC_HEARTBEAT_GRACE_SECONDS,
+  RPC_PORT,
+  RPC_SERVER_CONTAINER_PATH,
+  RpcUnreachableError,
+  rpcPodStep
 } from '../src/k8s/rpc'
 
 const GRACE_MS = RPC_HEARTBEAT_GRACE_SECONDS * 1000
@@ -45,6 +55,16 @@ const GRACE_MS = RPC_HEARTBEAT_GRACE_SECONDS * 1000
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/** Await a promise that is expected to reject and return its error. */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise
+  } catch (err) {
+    return err as Error
+  }
+  throw new Error('expected the promise to reject')
+}
 
 /** Build a minimal Response-like object that satisfies the fetch API. */
 function fakeResponse(
@@ -77,6 +97,286 @@ function fakeResponse(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('deployRpcServer', () => {
+  type StepResult = { exitCode: number; stdout: string }
+
+  const TOKEN = 'secret-token-123'
+  const OOM_LINE = 'rpc-server: oom_score_adj -1000 applied'
+  const LISTENING = `RPC server listening on [::]:${RPC_PORT}`
+
+  let realFetch: typeof fetch
+  let mockFetch: jest.Mock
+  let tmpDir: string
+  let imageBinary: string
+  let savedEnv: NodeJS.ProcessEnv
+
+  /**
+   * Route mocks by command content.
+   *   execPodStepOutput: server start (`env ... rpc-server`), pkill cleanup,
+   *   log tail. global.fetch: the /health probe.
+   */
+  function setupDefaultMocks(overrides?: {
+    start?: StepResult | Error | ((attempt: number) => StepResult)
+    log?: StepResult
+    health?: 'ok' | 'fail-once-ok' | 'always-fail' | 'network-error'
+  }): void {
+    const cfg = {
+      start: {
+        exitCode: 0,
+        stdout: `${OOM_LINE}\n${LISTENING}`
+      } as StepResult | Error | ((attempt: number) => StepResult),
+      log: { exitCode: 0, stdout: '(no log)' },
+      health: 'ok' as 'ok' | 'fail-once-ok' | 'always-fail' | 'network-error',
+      ...overrides
+    }
+
+    let startCalls = 0
+    mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
+      if (cmd[0] === 'env') {
+        startCalls++
+        if (cfg.start instanceof Error) throw cfg.start
+        if (typeof cfg.start === 'function') return cfg.start(startCalls)
+        return cfg.start
+      }
+      return cfg.log
+    })
+
+    let healthCalls = 0
+    mockFetch.mockImplementation(async () => {
+      healthCalls++
+      switch (cfg.health) {
+        case 'ok':
+          return fakeResponse(200, { status: 'ok' })
+        case 'fail-once-ok':
+          return healthCalls === 1
+            ? fakeResponse(500)
+            : fakeResponse(200, { status: 'ok' })
+        case 'always-fail':
+          return fakeResponse(500)
+        case 'network-error':
+          throw new Error('fetch failed')
+      }
+    })
+  }
+
+  // Health polling waits on the wall clock; jump it forward on every probe so
+  // a server that never becomes healthy times out instantly.
+  function fastForwardClockOnEachProbe(): void {
+    const startTime = Date.now()
+    let offset = 0
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + offset)
+    mockFetch.mockImplementation(async () => {
+      offset += 16000
+      return fakeResponse(500)
+    })
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    savedEnv = { ...process.env }
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rpc-deploy-'))
+    imageBinary = path.join(tmpDir, 'image-rpc-server')
+    fs.writeFileSync(imageBinary, 'fake-binary', { mode: 0o600 })
+    fs.mkdirSync(path.join(tmpDir, '_temp'))
+    process.env.RUNNER_TEMP = path.join(tmpDir, '_temp')
+    process.env.ACTIONS_RUNNER_RPC_SERVER_PATH = imageBinary
+
+    realFetch = global.fetch
+    mockFetch = jest.fn()
+    global.fetch = mockFetch as unknown as typeof fetch
+
+    mockGetPodByName.mockResolvedValue({ status: { podIP: '10.0.0.1' } })
+    setupDefaultMocks()
+  })
+
+  afterEach(() => {
+    global.fetch = realFetch
+    process.env = savedEnv
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    jest.restoreAllMocks()
+  })
+
+  function startCommands(): string[][] {
+    return mockExecPodStepOutput.mock.calls
+      .map(([cmd]) => cmd as string[])
+      .filter(cmd => cmd[0] === 'env')
+  }
+
+  it('copies the binary from the image to RUNNER_TEMP, executable', async () => {
+    await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    const copied = path.join(process.env.RUNNER_TEMP as string, 'rpc-server')
+    expect(fs.readFileSync(copied, 'utf8')).toBe('fake-binary')
+    expect(fs.statSync(copied).mode & 0o777).toBe(0o755)
+  })
+
+  it('uses the default image path when ACTIONS_RUNNER_RPC_SERVER_PATH is unset', async () => {
+    delete process.env.ACTIONS_RUNNER_RPC_SERVER_PATH
+    await expect(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    ).rejects.toThrow('/home/runner/k8s/rpc-server')
+  })
+
+  it('throws when the binary is missing from the image, without starting anything', async () => {
+    process.env.ACTIONS_RUNNER_RPC_SERVER_PATH = path.join(tmpDir, 'absent')
+
+    await expect(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    ).rejects.toThrow('RPC server binary not found')
+    expect(mockExecPodStepOutput).not.toHaveBeenCalled()
+  })
+
+  it('throws if the pod has no IP address', async () => {
+    mockGetPodByName.mockResolvedValue({ status: {} })
+
+    await expect(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    ).rejects.toThrow('has no IP address')
+  })
+
+  it('starts the copied binary on the fixed port with --daemonize and the token', async () => {
+    await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    const [cmd] = startCommands()
+    expect(cmd.slice(2)).toEqual([
+      RPC_SERVER_CONTAINER_PATH,
+      '--port',
+      String(RPC_PORT),
+      '--token',
+      TOKEN,
+      '--daemonize'
+    ])
+    expect(RPC_PORT).toBe(8765)
+    expect(RPC_SERVER_CONTAINER_PATH).toBe('/__w/_temp/rpc-server')
+  })
+
+  it('passes the shared grace constant to the server as its watchdog timeout', async () => {
+    await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    const [cmd] = startCommands()
+    expect(cmd[1]).toBe(
+      `RPC_HEARTBEAT_TIMEOUT_SECS=${RPC_HEARTBEAT_GRACE_SECONDS}`
+    )
+    expect(RPC_HEARTBEAT_GRACE_SECONDS).toBe(120)
+  })
+
+  it('returns the pod IP and fixed port once /health answers', async () => {
+    setupDefaultMocks({ health: 'fail-once-ok' })
+
+    const result = await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    expect(result).toEqual({ podIp: '10.0.0.1', port: RPC_PORT })
+    expect(mockFetch.mock.calls[0][0]).toBe(
+      `http://10.0.0.1:${RPC_PORT}/health`
+    )
+  })
+
+  it('reports the OOM protection line from the server start output', async () => {
+    await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    expect(core.info).toHaveBeenCalledWith(OOM_LINE)
+  })
+
+  it('never logs the token or the start command', async () => {
+    setupDefaultMocks({ start: { exitCode: 1, stdout: 'boom' } })
+    fastForwardClockOnEachProbe()
+    await deployRpcServer('my-pod', 'my-container', TOKEN).catch(() => {})
+    setupDefaultMocks({ health: 'always-fail' })
+    fastForwardClockOnEachProbe()
+    await deployRpcServer('my-pod', 'my-container', TOKEN).catch(() => {})
+
+    const logged = [
+      ...(core.debug as jest.Mock).mock.calls,
+      ...(core.info as jest.Mock).mock.calls,
+      ...(core.warning as jest.Mock).mock.calls,
+      ...(core.error as jest.Mock).mock.calls
+    ]
+      .map(args => String(args[0]))
+      .join('\n')
+    expect(logged).not.toContain(TOKEN)
+    expect(logged).not.toContain('--daemonize')
+  })
+
+  it('retries the start when the output has no listening line', async () => {
+    setupDefaultMocks({
+      start: attempt =>
+        attempt === 1
+          ? { exitCode: 0, stdout: '' }
+          : { exitCode: 0, stdout: LISTENING }
+    })
+
+    const result = await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    expect(result.port).toBe(RPC_PORT)
+    expect(startCommands()).toHaveLength(2)
+  })
+
+  it('cleans up a leftover server before a retry, without matching its own shell', async () => {
+    setupDefaultMocks({
+      start: attempt =>
+        attempt === 1
+          ? { exitCode: 1, stdout: 'address in use' }
+          : { exitCode: 0, stdout: LISTENING }
+    })
+
+    await deployRpcServer('my-pod', 'my-container', TOKEN)
+
+    const cleanup = mockExecPodStepOutput.mock.calls
+      .map(([cmd]) => (cmd as string[]).join(' '))
+      .find(cmd => cmd.includes('pkill'))
+    expect(cleanup).toBeDefined()
+    // The `[_]` keeps the pattern from matching the sh -c command line itself.
+    expect(cleanup).toContain('[_]temp/rpc-server')
+  })
+
+  it('throws after three failed starts, with per-attempt diagnostics', async () => {
+    setupDefaultMocks({ start: new Error('exec denied') })
+
+    const err = await rejectionOf(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    )
+
+    expect(err.message).toContain('RPC server failed after 3 attempts')
+    expect(err.message).toContain('attempt 1:')
+    expect(err.message).toContain('attempt 3:')
+    expect(err.message).toContain('exec denied')
+    expect(startCommands()).toHaveLength(3)
+  })
+
+  it('throws when the health check never passes, including the server log', async () => {
+    setupDefaultMocks({
+      log: { exitCode: 0, stdout: 'bind: permission denied' },
+      health: 'always-fail'
+    })
+    fastForwardClockOnEachProbe()
+
+    const err = await rejectionOf(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    )
+
+    expect(err.message).toContain('RPC server failed after 3 attempts')
+    expect(err.message).toContain('health check timed out')
+    expect(err.message).toContain('bind: permission denied')
+    expect(startCommands()).toHaveLength(3)
+  })
+
+  it('treats health check network errors as a failed health check', async () => {
+    setupDefaultMocks({ health: 'network-error' })
+    const startTime = Date.now()
+    let offset = 0
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + offset)
+    mockFetch.mockImplementation(async () => {
+      offset += 16000
+      throw new Error('fetch failed')
+    })
+
+    await expect(
+      deployRpcServer('my-pod', 'my-container', TOKEN)
+    ).rejects.toThrow('RPC server failed after 3 attempts')
+  })
+})
 
 describe('rpcPodStep', () => {
   const POD_IP = '10.0.0.1'
@@ -676,8 +976,8 @@ describe('rpcPodStep', () => {
     )
 
     // Advance fake clock in small steps to let both sleep and setInterval fire.
-    // LOG_POLL_INTERVAL_MS = 200, HEARTBEAT_INTERVAL_MS = 3000
-    // 20 polls * 200ms = 4000ms total, which is >3000 so heartbeat fires.
+    // The idle poll backs off 200, 400, 800, then 1000ms, so 20 idle polls take
+    // about 18.4s; HEARTBEAT_INTERVAL_MS = 3000 fires several times within it.
     for (let i = 0; i < 100; i++) {
       await jest.advanceTimersByTimeAsync(200)
     }
@@ -947,6 +1247,216 @@ describe('rpcPodStep', () => {
     await expect(
       rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
     ).rejects.toThrow('RPC server process died')
+  })
+
+  describe('when the server dies mid-step', () => {
+    // Heartbeats fail and the clock jumps past the grace on the first /status.
+    function setupDeadServer(podStatus: unknown): void {
+      const startTime = Date.now()
+      let timeOffset = 0
+      jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+      mockGetPodByName.mockResolvedValue({ status: podStatus })
+      mockExecPodStepOutput.mockResolvedValue({ exitCode: 0, stdout: 'Killed' })
+      fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        const urlStr = url.toString()
+        if (urlStr.includes('/exec') && init?.method === 'POST') {
+          return fakeResponse(200, { status: 'running' })
+        }
+        if (urlStr.includes('/logs')) {
+          return fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        }
+        if (urlStr.includes('/status')) {
+          timeOffset += GRACE_MS + 1000
+          return fakeResponse(200, { status: 'running', exit_code: null })
+        }
+        throw new Error('connection refused')
+      })
+    }
+
+    function killGroupCalls(): string[][] {
+      return mockExecPodStepOutput.mock.calls
+        .map(([cmd]) => cmd as string[])
+        .filter(cmd => cmd.join(' ').includes('job.pgid'))
+    }
+
+    it('kills the step process group once, then fails with the diagnosis', async () => {
+      setupDeadServer({
+        phase: 'Running',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: { running: { startedAt: '2025-01-01T00:00:00Z' } }
+          }
+        ]
+      })
+
+      await expect(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      ).rejects.toThrow('RPC server process died')
+
+      const calls = killGroupCalls()
+      expect(calls).toHaveLength(1)
+      expect(calls[0].slice(0, 2)).toEqual(['sh', '-c'])
+      expect(calls[0][2]).toBe(buildKillStepGroupCommand())
+      expect(calls[0][2]).toContain('/tmp/rpc-logs/job.pgid')
+      // Targets the job container, with a short timeout.
+      const call = mockExecPodStepOutput.mock.calls.find(([cmd]) =>
+        (cmd as string[]).join(' ').includes('job.pgid')
+      ) as unknown[]
+      expect(call[1]).toBe(POD_NAME)
+      expect(call[2]).toBe(CONTAINER_NAME)
+      expect(call[3]).toBeLessThanOrEqual(15000)
+    })
+
+    it('still fails the step when the kill exec itself fails', async () => {
+      setupDeadServer({
+        phase: 'Running',
+        podIP: POD_IP,
+        containerStatuses: [
+          { name: CONTAINER_NAME, state: { running: { startedAt: 'x' } } }
+        ]
+      })
+      mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
+        if (cmd.join(' ').includes('job.pgid')) throw new Error('exec failed')
+        return { exitCode: 0, stdout: 'Killed' }
+      })
+
+      await expect(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      ).rejects.toThrow('RPC server process died')
+    })
+
+    it('does not run the kill exec for other causes such as OOM', async () => {
+      setupDeadServer({
+        phase: 'Failed',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: { terminated: { reason: 'OOMKilled', exitCode: 137 } }
+          }
+        ]
+      })
+
+      await expect(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      ).rejects.toThrow('OOMKilled')
+      expect(killGroupCalls()).toHaveLength(0)
+    })
+  })
+
+  describe('/exec reachability', () => {
+    const refused = (): Error =>
+      Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect ECONNREFUSED'), {
+          code: 'ECONNREFUSED'
+        })
+      })
+    const timedOut = (): Error =>
+      Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect timeout'), {
+          code: 'UND_ERR_CONNECT_TIMEOUT'
+        })
+      })
+
+    it('throws RpcUnreachableError when every attempt fails to connect', async () => {
+      fetchMock
+        .mockRejectedValueOnce(refused())
+        .mockRejectedValueOnce(timedOut())
+        .mockRejectedValueOnce(refused())
+
+      const err = await rejectionOf(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      )
+
+      expect(err).toBeInstanceOf(RpcUnreachableError)
+      expect(err.message).toContain('RPC /exec network error after 3 attempts')
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+    })
+
+    it('treats an AggregateError of refused addresses as unreachable', async () => {
+      const aggregate = Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('all addresses failed'), {
+          errors: [{ code: 'ECONNREFUSED' }, { code: 'ENETUNREACH' }]
+        })
+      })
+      fetchMock.mockRejectedValue(aggregate)
+
+      await expect(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      ).rejects.toBeInstanceOf(RpcUnreachableError)
+    })
+
+    it('does not fall back when an error could have come after the request was sent', async () => {
+      const reset = Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('read ECONNRESET'), {
+          code: 'ECONNRESET'
+        })
+      })
+      fetchMock
+        .mockRejectedValueOnce(refused())
+        .mockRejectedValueOnce(reset)
+        .mockRejectedValueOnce(refused())
+
+      const err = await rejectionOf(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      )
+
+      expect(err).not.toBeInstanceOf(RpcUnreachableError)
+      expect(err.message).toContain('RPC /exec network error')
+    })
+
+    it('does not fall back on a response timeout (the server may have the step)', async () => {
+      const timeout = new DOMException(
+        'The operation timed out',
+        'TimeoutError'
+      )
+      fetchMock.mockRejectedValue(timeout)
+
+      const err = await rejectionOf(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      )
+
+      expect(err).not.toBeInstanceOf(RpcUnreachableError)
+    })
+
+    it('does not fall back once the server answered, even if later attempts cannot connect', async () => {
+      fetchMock
+        .mockResolvedValueOnce(fakeResponse(503, 'busy'))
+        .mockRejectedValueOnce(refused())
+        .mockRejectedValueOnce(refused())
+
+      const err = await rejectionOf(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      )
+
+      expect(err).not.toBeInstanceOf(RpcUnreachableError)
+    })
+
+    it('does not fall back after the server accepted the step and then the log poll fails', async () => {
+      const startTime = Date.now()
+      let timeOffset = 0
+      jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+      fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        const urlStr = url.toString()
+        if (urlStr.includes('/exec') && init?.method === 'POST') {
+          return fakeResponse(200, { status: 'running' })
+        }
+        // Everything after acceptance cannot connect.
+        timeOffset += GRACE_MS + 1000
+        throw refused()
+      })
+
+      const err = await rejectionOf(
+        rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+      )
+
+      expect(err).not.toBeInstanceOf(RpcUnreachableError)
+      expect(
+        fetchMock.mock.calls.filter(([u]) => u.includes('/exec'))
+      ).toHaveLength(1)
+    })
   })
 
   it('should handle /status fetch failures gracefully (retry)', async () => {
@@ -1570,4 +2080,83 @@ describe('killRpcJob', () => {
 
     await expect(killRpcJob(POD_IP, PORT, TOKEN)).resolves.toBeUndefined()
   })
+})
+
+describe('buildKillStepGroupCommand', () => {
+  // Run the real command under each shell the job image might provide and
+  // check that a process group recorded in the pgid file is actually killed.
+  const shells = ['sh', 'busybox sh'].filter(sh => {
+    const bin = sh.split(' ')[0]
+    return (
+      spawnSync('sh', ['-c', `command -v ${bin}`], { stdio: 'ignore' })
+        .status === 0
+    )
+  })
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  it.each(shells)('kills the recorded process group with %s', async sh => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rpc-pgid-'))
+    const pgidFile = path.join(dir, 'job.pgid')
+    // A step leader in its own session (detached does setsid, so pgid == pid),
+    // with a child in the group.
+    const leader = spawn('sh', ['-c', 'sleep 60 & wait'], {
+      stdio: 'ignore',
+      detached: true
+    })
+    leader.unref()
+    try {
+      const pid = leader.pid as number
+      fs.writeFileSync(pgidFile, String(pid))
+      await new Promise(r => setTimeout(r, 300))
+      expect(isAlive(pid)).toBe(true)
+
+      const [bin, ...args] = sh.split(' ')
+      const result = spawnSync(
+        bin,
+        [...args, '-c', buildKillStepGroupCommand(pgidFile)],
+        { timeout: 10000 }
+      )
+
+      expect(result.status).toBe(0)
+      await new Promise(r => setTimeout(r, 300))
+      expect(isAlive(pid)).toBe(false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it.each(shells)(
+    'does nothing when the pgid file is missing or invalid (%s)',
+    sh => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rpc-pgid-'))
+      try {
+        const [bin, ...args] = sh.split(' ')
+        const missing = spawnSync(
+          bin,
+          [...args, '-c', buildKillStepGroupCommand(path.join(dir, 'none'))],
+          { timeout: 10000 }
+        )
+        expect(missing.status).toBe(0)
+
+        const bad = path.join(dir, 'bad.pgid')
+        fs.writeFileSync(bad, '-1 oops')
+        const invalid = spawnSync(
+          bin,
+          [...args, '-c', buildKillStepGroupCommand(bad)],
+          { timeout: 10000 }
+        )
+        expect(invalid.status).toBe(0)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
 })
