@@ -18,6 +18,14 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const LOG_DIR: &str = "/tmp/rpc-logs";
+// Process-group id of the running step. If this server dies, the hook reads it
+// to kill the step's group, which would otherwise keep running unsupervised.
+// RPC_PGID_FILE overrides the path so tests can run servers side by side.
+const PGID_FILE_DEFAULT: &str = "/tmp/rpc-logs/job.pgid";
+
+fn pgid_file() -> String {
+    env::var("RPC_PGID_FILE").unwrap_or_else(|_| PGID_FILE_DEFAULT.to_string())
+}
 const MAX_CHUNK: usize = 1_048_576;
 
 // Lifecycle timeouts. Defaults match production; each is overridable via an
@@ -257,12 +265,21 @@ fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
 
 // --- /proc/self/oom_score_adj helpers ---
 
-fn write_oom_score_adj_self(value: &str) {
-    if let Ok(mut f) = OpenOptions::new()
-        .write(true)
-        .open("/proc/self/oom_score_adj")
-    {
-        let _ = f.write_all(value.as_bytes());
+const OOM_SCORE_ADJ_SELF_PATH: &str = "/proc/self/oom_score_adj";
+
+/// Write `value` to an oom_score_adj file. Lowering the score below its
+/// current value needs CAP_SYS_RESOURCE, so the open or the write can be
+/// refused; the error is returned so the caller can say which happened.
+fn write_oom_score_adj(path: &str, value: &str) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.write_all(value.as_bytes())
+}
+
+/// One startup log line saying whether the OOM protection took effect.
+fn oom_protection_message(value: &str, result: &std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => format!("rpc-server: oom_score_adj {value} applied"),
+        Err(e) => format!("rpc-server: oom_score_adj {value} refused ({e}); continuing unprotected"),
     }
 }
 
@@ -304,7 +321,11 @@ fn spawn_job(job_id: &str, script_path: &str) -> std::io::Result<Child> {
             Ok(())
         });
     }
-    cmd.spawn()
+    let child = cmd.spawn()?;
+    // setsid() made the child its own group leader, so its pid is the pgid.
+    // Best effort: the step runs even if the file cannot be written.
+    let _ = fs::write(pgid_file(), child.id().to_string());
+    Ok(child)
 }
 
 // Waiter owns the Child. It is the only place that calls Child::wait(), so
@@ -329,6 +350,8 @@ fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
             JobStatus::Failed
         };
         s.child_pid = None;
+        // The step is gone, so the group id on disk no longer names anything.
+        let _ = fs::remove_file(pgid_file());
         // Disarm the watchdog: the job is done, and the client stops sending
         // heartbeats once it observes a terminal status. Without this the
         // watchdog would, one timeout later, log a misleading "heartbeat
@@ -823,8 +846,19 @@ fn main() {
     // no port file, no polling.
     let listener = bind_dual_stack(port).expect("bind");
     let actual_port = listener.local_addr().expect("local_addr").port();
-    println!("RPC server listening on [::]:{actual_port}");
-    let _ = std::io::stdout().flush();
+
+    // Protect the server itself from the OOM killer (children reset their own
+    // score to 0 in pre_exec). A refusal is not fatal, but it is logged so a
+    // run shows whether the protection holds on this cluster. The line goes
+    // out before the port line, which is the last thing the launcher needs.
+    // The score is inherited across the daemonize fork below.
+    let oom_result = write_oom_score_adj(OOM_SCORE_ADJ_SELF_PATH, "-1000");
+    {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{}", oom_protection_message("-1000", &oom_result));
+        let _ = writeln!(out, "RPC server listening on [::]:{actual_port}");
+        let _ = out.flush();
+    }
 
     if daemonize {
         // Detach from the launching `kubectl exec` so it returns once it has
@@ -846,7 +880,6 @@ fn main() {
         }
     }
 
-    write_oom_score_adj_self("-1000");
     let _ = fs::create_dir_all(LOG_DIR);
 
     let state = Arc::new(Mutex::new(State::new(token)));
@@ -869,6 +902,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oom_protection_applied_when_write_succeeds() {
+        let path = std::env::temp_dir().join(format!("oom_ok_{}", std::process::id()));
+        // oom_score_adj is opened without O_CREAT, so the file must exist.
+        fs::write(&path, "0").unwrap();
+        let result = write_oom_score_adj(path.to_str().unwrap(), "-1000");
+        let written = fs::read_to_string(&path).unwrap_or_default();
+        let _ = fs::remove_file(&path);
+        assert!(result.is_ok());
+        assert_eq!(written, "-1000");
+        assert_eq!(
+            oom_protection_message("-1000", &result),
+            "rpc-server: oom_score_adj -1000 applied"
+        );
+    }
+
+    #[test]
+    fn oom_protection_refused_when_write_fails() {
+        // A path under a directory that does not exist cannot be opened.
+        let result = write_oom_score_adj("/nonexistent-dir/oom_score_adj", "-1000");
+        assert!(result.is_err());
+        let msg = oom_protection_message("-1000", &result);
+        assert!(msg.starts_with("rpc-server: oom_score_adj -1000 refused ("));
+        assert!(msg.ends_with("continuing unprotected"));
+    }
 
     #[test]
     fn lock_state_recovers_from_poison() {

@@ -305,6 +305,79 @@ fn kill_terminates_running_job() {
 }
 
 #[test]
+fn pgid_file_names_the_running_step_group_and_is_removed_when_it_ends() {
+    let dir = std::env::temp_dir().join(format!("rpc-pgid-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let pgid_path = dir.join("job.pgid");
+    let _ = std::fs::remove_file(&pgid_path);
+    let pgid_arg = pgid_path.to_string_lossy().into_owned();
+    let s = Server::start_with_env(&[("RPC_PGID_FILE", pgid_arg.as_str())]);
+
+    let script = s.write_script("pgid.sh", "#!/bin/sh\nsleep 2\n");
+    let body = format!(r#"{{"id":"pgid","path":"{script}"}}"#);
+    let (c, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&body));
+    assert_eq!(c, 200);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let pgid: i32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&pgid_path) {
+            if let Ok(n) = text.trim().parse() {
+                break n;
+            }
+        }
+        assert!(Instant::now() < deadline, "pgid file never appeared");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(pgid > 1);
+    // `kill -0 -- -PGID` succeeds only if the group exists.
+    let alive = Command::new("kill")
+        .args(["-0", "--", &format!("-{pgid}")])
+        .status()
+        .unwrap();
+    assert!(alive.success(), "group {pgid} should be running");
+
+    s.wait_terminal(Duration::from_secs(5));
+    assert!(
+        !pgid_path.exists(),
+        "pgid file should be removed once the step ends"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn startup_logs_whether_oom_protection_was_applied() {
+    let bin = env!("CARGO_BIN_EXE_rpc-server");
+    let mut child = Command::new(bin)
+        .args(["--port", "0", "--token", TOKEN])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rpc-server");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).expect("read") == 0 {
+            break;
+        }
+        let done = line.starts_with("RPC server listening on");
+        lines.push(line);
+        if done {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("rpc-server: oom_score_adj -1000 applied")
+                || l.starts_with("rpc-server: oom_score_adj -1000 refused")),
+        "no oom_score_adj outcome line in {lines:?}"
+    );
+}
+
+#[test]
 fn logs_serve_stdout_and_stderr() {
     let s = Server::start();
     let script = s.write_script(

@@ -8,6 +8,7 @@ import {
   writeToResponseFile,
   ServiceContainerInfo
 } from 'hooklib'
+import * as crypto from 'crypto'
 import path from 'path'
 import {
   containerPorts,
@@ -29,6 +30,13 @@ import {
   fixArgs
 } from '../k8s/utils'
 import { CONTAINER_EXTENSION_PREFIX, JOB_CONTAINER_NAME } from './constants'
+import { deployRpcServer } from '../k8s/rpc'
+
+interface RpcState {
+  rpcPodIp: string
+  rpcPort: number
+  rpcToken: string
+}
 
 export async function prepareJob(
   args: PrepareJobArgs,
@@ -119,21 +127,44 @@ export async function prepareJob(
     throw new Error(`failed to determine if the pod is alpine: ${message}`)
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)
-  generateResponseFile(responseFile, args, createdPod, isAlpine)
+  const rpcState = await startRpcServer(createdPod.metadata.name)
+  generateResponseFile(responseFile, args, createdPod, isAlpine, rpcState)
+}
+
+// Starts the in-pod server for script steps. Any failure (binary missing from
+// the image, start failed, health check never passed) is not fatal: without RPC
+// state, run-script-step uses the exec launcher instead.
+async function startRpcServer(podName: string): Promise<RpcState | undefined> {
+  const rpcToken = crypto.randomUUID()
+  try {
+    const { podIp, port } = await deployRpcServer(
+      podName,
+      JOB_CONTAINER_NAME,
+      rpcToken
+    )
+    core.info(`[prepare_job] in-pod server ready at ${podIp}:${port}`)
+    return { rpcPodIp: podIp, rpcPort: port, rpcToken }
+  } catch (err) {
+    core.info(`in-pod server not started: ${formatError(err)}`)
+    core.warning('in-pod server unavailable, using exec launcher')
+    return undefined
+  }
 }
 
 function generateResponseFile(
   responseFile: string,
   args: PrepareJobArgs,
   appPod: k8s.V1Pod,
-  isAlpine
+  isAlpine,
+  rpcState?: RpcState
 ): void {
   if (!appPod.metadata?.name) {
     throw new Error('app pod must have metadata.name specified')
   }
   const response = {
     state: {
-      jobPod: appPod.metadata.name
+      jobPod: appPod.metadata.name,
+      ...rpcState
     },
     context: {},
     isAlpine

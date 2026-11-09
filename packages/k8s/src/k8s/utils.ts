@@ -149,7 +149,10 @@ export function writeEntryPointScript(
     environmentPrefix = `env ${envBuffer.join(' ')} `
   }
 
+  // `exec 2>&1` merges stderr into stdout at the shell level, so a step's
+  // errors stay in order with its output on the single log stream.
   const content = `#!/bin/sh -l
+exec 2>&1
 ${exportPath}
 cd ${workingDirectory} && \
 exec ${environmentPrefix} ${entryPoint} ${

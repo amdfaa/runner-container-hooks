@@ -34,7 +34,13 @@ jest.mock('crypto', () => {
   }
 })
 
-import { killRpcJob, rpcPodStep } from '../src/k8s/rpc'
+import {
+  killRpcJob,
+  rpcPodStep,
+  RPC_HEARTBEAT_GRACE_SECONDS
+} from '../src/k8s/rpc'
+
+const GRACE_MS = RPC_HEARTBEAT_GRACE_SECONDS * 1000
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -672,7 +678,7 @@ describe('rpcPodStep', () => {
     // Advance fake clock in small steps to let both sleep and setInterval fire.
     // LOG_POLL_INTERVAL_MS = 200, HEARTBEAT_INTERVAL_MS = 3000
     // 20 polls * 200ms = 4000ms total, which is >3000 so heartbeat fires.
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 100; i++) {
       await jest.advanceTimersByTimeAsync(200)
     }
 
@@ -751,7 +757,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
@@ -794,7 +800,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
@@ -836,7 +842,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
@@ -873,7 +879,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
@@ -886,7 +892,7 @@ describe('rpcPodStep', () => {
 
     await expect(
       rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
-    ).rejects.toThrow('RPC heartbeat failed for 60s')
+    ).rejects.toThrow('RPC heartbeat failed for 120s')
   })
 
   it('should detect RPC process death when container is still running', async () => {
@@ -927,7 +933,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
@@ -1504,7 +1510,7 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        timeOffset += 61000
+        timeOffset += GRACE_MS + 1000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )

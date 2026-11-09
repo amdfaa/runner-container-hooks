@@ -13,6 +13,7 @@ import {
   runScriptStep
 } from './hooks'
 import { isAuthPermissionsOK, namespace, requiredPermissions } from './k8s'
+import { installProcessHandlers } from './safety/process-handlers'
 
 async function run(): Promise<void> {
   try {
@@ -53,4 +54,7 @@ async function run(): Promise<void> {
   }
 }
 
+// Cancel cleanup (killing the in-pod step) depends on these handlers, so they
+// go in before anything else runs.
+installProcessHandlers()
 void run()
