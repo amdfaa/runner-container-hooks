@@ -7,9 +7,8 @@ import { sleep } from './utils'
 import { execPodStepOutput, getPodByName } from './index'
 
 interface RpcStatusResponse {
-  // null when no job has run yet (server is in initial 'idle' state). The
-  // Python server sets _job_id = None at startup and only assigns a value
-  // when /exec accepts a job.
+  // null when no job has run yet (server is in initial 'idle' state): the
+  // server only assigns an id when /exec accepts a job.
   id: string | null
   // 'starting'/'killing' are transient server-side states (job being launched
   // or torn down); the poll loop treats them like 'running' and keeps waiting.
