@@ -64,7 +64,7 @@ async function handleSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<void> {
   ])
   if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
   // 130 for SIGINT, 143 for SIGTERM — the standard 128+signum convention.
-  // Surfaces the cause to the OSDC wrapper (and to anyone reading the log).
+  // Surfaces the cause to the runner (and to anyone reading the log).
   process.exit(signal === 'SIGINT' ? 130 : 143)
 }
 
@@ -92,12 +92,4 @@ export function installProcessHandlers(): void {
     fatal(`unhandledRejection: ${msg}`)
     process.exit(1)
   })
-}
-
-// Exposed for tests so they can reset module-scoped state between cases
-// without using `require.cache` tricks.
-export function _resetForTests(): void {
-  installed = false
-  shuttingDown = false
-  cleanupCallbacks = []
 }

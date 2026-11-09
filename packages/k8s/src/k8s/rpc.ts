@@ -2,6 +2,7 @@ import * as core from '@actions/core'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import { join } from 'path'
+import * as shlex from 'shlex'
 import { sleep } from './utils'
 import { execPodStepOutput, getPodByName } from './index'
 
@@ -50,6 +51,13 @@ const KILL_STEP_GROUP_TIMEOUT_MS = 10000
 const KILL_TIMEOUT_MS = 5000
 const DIAGNOSTIC_TIMEOUT_MS = 15000
 const DIAGNOSTIC_EXEC_TIMEOUT_MS = 10000
+
+// execPodStepOutput splits its argv with fixArgs (join with spaces, then
+// shlex.split), which would break a `sh -c` script into separate words. Quoting
+// the script makes it survive that round trip as the single -c argument.
+function shScript(script: string): string[] {
+  return ['sh', '-c', shlex.quote(script)]
+}
 
 function rpcUrl(podIp: string, port: number, path: string): string {
   const host = podIp.includes(':') ? `[${podIp}]` : podIp
@@ -119,7 +127,7 @@ export async function deployRpcServer(
       // The `[_]` keeps this shell's own command line from matching the pattern.
       try {
         await execPodStepOutput(
-          ['sh', '-c', `pkill -f '[_]temp/rpc-server' 2>/dev/null; true`],
+          shScript(`pkill -f '[_]temp/rpc-server' 2>/dev/null; true`),
           podName,
           containerName
         )
@@ -180,11 +188,7 @@ export async function deployRpcServer(
     let serverLog = ''
     try {
       const logResult = await execPodStepOutput(
-        [
-          'sh',
-          '-c',
-          'tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no log)"'
-        ],
+        shScript('tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no log)"'),
         podName,
         containerName
       )
@@ -277,11 +281,9 @@ async function diagnosePodFailure(
       let execTimer: ReturnType<typeof setTimeout>
       const result = await Promise.race([
         execPodStepOutput(
-          [
-            'sh',
-            '-c',
+          shScript(
             'tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no server log)"'
-          ],
+          ),
           podName,
           containerName
         ),
@@ -351,7 +353,8 @@ function isNeverConnected(err: unknown): boolean {
 /**
  * Build the shell command that kills the step's process group after the server
  * died: SIGTERM, a short wait, then SIGKILL. Does nothing if the pgid file is
- * missing (the step already ended) or empty.
+ * missing (the step already ended), empty, not a plain pid, or names pgid 0 or 1
+ * (`kill -- -1` would signal every process the user can).
  */
 export function buildKillStepGroupCommand(
   pgidFile: string = RPC_PGID_FILE
@@ -360,7 +363,7 @@ export function buildKillStepGroupCommand(
   // and takes `kill -s SIG -PGID`. Try one, then the other.
   return (
     `P=$(cat ${pgidFile} 2>/dev/null); ` +
-    `case "$P" in ''|*[!0-9]*) exit 0;; esac; ` +
+    `case "$P" in ''|*[!0-9]*|0*|1) exit 0;; esac; ` +
     `k() { kill -s "$1" -- "-$P" 2>/dev/null || kill -s "$1" "-$P" 2>/dev/null; }; ` +
     `k TERM; sleep 1; k KILL; exit 0`
   )
@@ -373,7 +376,7 @@ async function killStepGroup(
 ): Promise<void> {
   try {
     await execPodStepOutput(
-      ['sh', '-c', buildKillStepGroupCommand()],
+      shScript(buildKillStepGroupCommand()),
       podName,
       containerName,
       KILL_STEP_GROUP_TIMEOUT_MS

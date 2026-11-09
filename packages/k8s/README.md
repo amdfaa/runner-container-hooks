@@ -33,6 +33,7 @@ rules:
 - The `ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER` env should be set to true to prevent the runner from running any jobs outside of a container
 - The runner pod should map a persistent volume claim into the `_work` directory
     - The `ACTIONS_RUNNER_CLAIM_NAME` env should be set to the persistent volume claim that contains the runner's working directory, otherwise it defaults to `${ACTIONS_RUNNER_POD_NAME}-work`
+- Script steps run through a small in-pod server that `prepare_job` starts in the job container. Its binary is expected at `/home/runner/k8s/rpc-server` in the runner image; set `ACTIONS_RUNNER_RPC_SERVER_PATH` to use another path. If the binary is missing or the server does not come up, script steps fall back to the exec launcher.
 - Some actions runner env's are expected to be set. These are set automatically by the runner.
     - `RUNNER_WORKSPACE` is expected to be set to the workspace of the runner
     - `GITHUB_WORKSPACE` is expected to be set to the workspace of the job

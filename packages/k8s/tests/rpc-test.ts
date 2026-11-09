@@ -52,6 +52,13 @@ import {
 
 const GRACE_MS = RPC_HEARTBEAT_GRACE_SECONDS * 1000
 
+// The real execPodStepOutput splits its argv with fixArgs before the exec, so a
+// `sh -c` script only runs intact if it comes out of this round trip as one
+// argument. The module mock of ../src/k8s/utils above keeps only `sleep`.
+const { fixArgs } = jest.requireActual('../src/k8s/utils') as {
+  fixArgs: (args: string[]) => string[]
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -324,11 +331,32 @@ describe('deployRpcServer', () => {
     await deployRpcServer('my-pod', 'my-container', TOKEN)
 
     const cleanup = mockExecPodStepOutput.mock.calls
-      .map(([cmd]) => (cmd as string[]).join(' '))
-      .find(cmd => cmd.includes('pkill'))
+      .map(([cmd]) => cmd as string[])
+      .find(cmd => cmd.join(' ').includes('pkill'))
     expect(cleanup).toBeDefined()
     // The `[_]` keeps the pattern from matching the sh -c command line itself.
-    expect(cleanup).toContain('[_]temp/rpc-server')
+    // The script reaches the pod as one -c argument, not split into words.
+    expect(fixArgs(cleanup as string[])).toEqual([
+      'sh',
+      '-c',
+      `pkill -f '[_]temp/rpc-server' 2>/dev/null; true`
+    ])
+  })
+
+  it('sends the server-log tail as a single sh -c argument', async () => {
+    setupDefaultMocks({ health: 'always-fail' })
+    fastForwardClockOnEachProbe()
+
+    await rejectionOf(deployRpcServer('my-pod', 'my-container', TOKEN))
+
+    const tail = mockExecPodStepOutput.mock.calls
+      .map(([cmd]) => cmd as string[])
+      .find(cmd => cmd.join(' ').includes('tail'))
+    expect(fixArgs(tail as string[])).toEqual([
+      'sh',
+      '-c',
+      'tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no log)"'
+    ])
   })
 
   it('throws after three failed starts, with per-attempt diagnostics', async () => {
@@ -1297,9 +1325,13 @@ describe('rpcPodStep', () => {
 
       const calls = killGroupCalls()
       expect(calls).toHaveLength(1)
-      expect(calls[0].slice(0, 2)).toEqual(['sh', '-c'])
-      expect(calls[0][2]).toBe(buildKillStepGroupCommand())
-      expect(calls[0][2]).toContain('/tmp/rpc-logs/job.pgid')
+      // The whole script reaches the pod as one -c argument.
+      expect(fixArgs(calls[0])).toEqual([
+        'sh',
+        '-c',
+        buildKillStepGroupCommand()
+      ])
+      expect(buildKillStepGroupCommand()).toContain('/tmp/rpc-logs/job.pgid')
       // Targets the job container, with a short timeout.
       const call = mockExecPodStepOutput.mock.calls.find(([cmd]) =>
         (cmd as string[]).join(' ').includes('job.pgid')
@@ -2154,6 +2186,38 @@ describe('buildKillStepGroupCommand', () => {
           { timeout: 10000 }
         )
         expect(invalid.status).toBe(0)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
+
+  // A shell function named `kill` replaces the builtin and records its
+  // arguments, so no signal is sent while the test sees what would have been.
+  it.each(shells)(
+    'never signals pgid 0 or 1, and signals an ordinary pgid (%s)',
+    sh => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rpc-pgid-'))
+      try {
+        const [bin, ...args] = sh.split(' ')
+        const recorded = (pgid: string): string => {
+          const pgidFile = path.join(dir, 'job.pgid')
+          const log = path.join(dir, 'kill.log')
+          fs.writeFileSync(pgidFile, pgid)
+          fs.rmSync(log, { force: true })
+          const script = `kill() { echo "$@" >> ${log}; }; ${buildKillStepGroupCommand(pgidFile)}`
+          const result = spawnSync(bin, [...args, '-c', script], {
+            timeout: 10000
+          })
+          expect(result.status).toBe(0)
+          return fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
+        }
+
+        expect(recorded('0')).toBe('')
+        expect(recorded('1')).toBe('')
+        expect(recorded('007')).toBe('')
+        expect(recorded('4242')).toContain('-s TERM -- -4242')
+        expect(recorded('4242')).toContain('-s KILL -- -4242')
       } finally {
         fs.rmSync(dir, { recursive: true, force: true })
       }
