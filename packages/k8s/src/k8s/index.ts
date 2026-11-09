@@ -536,6 +536,83 @@ export async function execDetachedScriptStep(
   }
 }
 
+const EXEC_OUTPUT_TIMEOUT_MS = 60_000
+
+// The Kubernetes API reports a non-zero exit as a Failure status whose
+// details.causes carries a cause with reason "ExitCode". No such cause means
+// the exec itself failed (infrastructure), not the command.
+export function extractExitCode(resp: k8s.V1Status): number | null {
+  const cause = resp?.details?.causes?.find(c => c.reason === 'ExitCode')
+  if (!cause?.message) return null
+  const code = parseInt(cause.message, 10)
+  return Number.isNaN(code) ? null : code
+}
+
+// Runs a short command in the pod and returns its exit code and stdout.
+// A non-zero exit resolves; only an exec that could not run (connection
+// error, timeout) rejects.
+export async function execPodStepOutput(
+  command: string[],
+  podName: string,
+  containerName: string,
+  timeoutMs = EXEC_OUTPUT_TIMEOUT_MS
+): Promise<{ exitCode: number; stdout: string }> {
+  const exec = new k8s.Exec(kc)
+  const chunks: Buffer[] = []
+  const stdout = new stream.Writable({
+    write(chunk, _encoding, callback) {
+      chunks.push(Buffer.from(chunk))
+      callback()
+    }
+  })
+  let socket: { terminate?: () => void } | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await new Promise<{ exitCode: number; stdout: string }>(
+      (resolve, reject) => {
+        timer = setTimeout(() => {
+          try {
+            socket?.terminate?.()
+          } catch {
+            // already torn down
+          }
+          reject(new Error(`execPodStepOutput timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+        exec
+          .exec(
+            namespace(),
+            podName,
+            containerName,
+            fixArgs(command),
+            stdout,
+            process.stderr,
+            null,
+            false /* tty */,
+            resp => {
+              const output = Buffer.concat(chunks).toString('utf8').trim()
+              if (resp.status === 'Success') {
+                resolve({ exitCode: 0, stdout: output })
+                return
+              }
+              const exitCode = extractExitCode(resp)
+              if (exitCode !== null) {
+                resolve({ exitCode, stdout: output })
+              } else {
+                reject(new Error(formatError(resp?.message)))
+              }
+            }
+          )
+          .then(ws => {
+            socket = ws as unknown as { terminate?: () => void }
+          })
+          .catch(reject)
+      }
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function waitForJobToComplete(jobName: string): Promise<void> {
   const backOffManager = new BackOffManager()
   while (true) {
